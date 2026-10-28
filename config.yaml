@@ -1,0 +1,22 @@
+listen_addr: ":8080"
+redis_addr: "localhost:6379"
+default_limit: 100
+default_window: 1m
+
+routes:
+  - path: "/api/*"
+    backend: "http://localhost:9000"
+    limit: 100
+    window: 1m
+  - path: "/health"
+    backend: "http://localhost:9000"
+    limit: 1000
+    window: 1m
+
+client_overrides:
+  - client_id: "premium-client"
+    limit: 500
+    window: 1m
+  - client_id: "internal-service"
+    limit: 10000
+    window: 1m
