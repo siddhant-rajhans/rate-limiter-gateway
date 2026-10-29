@@ -1,56 +1,69 @@
 # Rate Limiter Gateway
 
+![Go 1.22](https://img.shields.io/badge/Go-1.22-00ADD8?logo=go&logoColor=white)
+![Redis](https://img.shields.io/badge/Redis-Lua%20Scripts-DC382D?logo=redis&logoColor=white)
+![Tests: 13 passing](https://img.shields.io/badge/tests-13%20passing-brightgreen)
+![License: MIT](https://img.shields.io/badge/license-MIT-green)
+
 Reverse-proxy API gateway with sliding-window rate limiting backed by Redis Lua scripts. Per-client and per-route limits, standard rate-limit headers, and sub-millisecond overhead on the hot path.
 
 ## Measured Results
 
+Benchmarked on AMD Ryzen 5 3550H (4C/8T), 2 GB RAM, Redis via miniredis (pure Go in-memory). Reproduce with `make bench`.
+
 | Metric | Value |
-|---|---|
-| Throughput (16 concurrent clients) | 632 req/s end-to-end |
-| Rate limit check overhead (p50) | 863 us |
-| Rate limit check overhead (p99) | 5.3 ms |
-| Rate limit check overhead (avg) | 1.2 ms |
-| Concurrent accuracy | 50/50 allowed, 50/50 rejected (limit=50, 100 goroutines) |
-| Tests | 13/13 passing |
+|--------|-------|
+| Throughput (16 concurrent clients) | **632 req/s** end-to-end |
+| Rate limit check overhead (p50) | **863 us** |
+| Rate limit check overhead (p99) | **5.3 ms** |
+| Rate limit check overhead (avg) | **1.2 ms** |
+| Concurrent accuracy | **50/50 allowed, 50/50 rejected** (limit=50, 100 goroutines) |
+| Tests | **13/13 passing** |
 | Test categories | unit, integration, concurrency |
 
 ## Architecture
 
-```mermaid
-graph LR
-    C[Client] -->|X-API-Key| G[Gateway :8080]
-    G -->|Lua EVAL| R[(Redis)]
-    R -->|allowed/rejected| G
-    G -->|proxy if allowed| B[Backend]
-    G -->|429 + Retry-After| C
+```
+        Client Request
+        X-API-Key: abc123
+              │
+              ▼
+┌─────────────────────────────────────────────┐
+│              Gateway :8080                  │
+│                                             │
+│   ┌───────────────────────────────────┐     │
+│   │         Route Matching            │     │
+│   │    /api/* ──→ backend:9000        │     │
+│   └─────────────────┬─────────────────┘     │
+│                     │                       │
+│                     ▼                       │
+│   ┌───────────────────────────────────┐     │
+│   │    Redis Lua EVAL  (atomic)       │     │
+│   │                                   │     │
+│   │  ZREMRANGEBYSCORE  trim window    │     │
+│   │  ZCARD             count entries  │     │
+│   │  ZADD              record req     │     │
+│   │  PEXPIRE           set TTL        │     │
+│   └────────┬─────────────────┬────────┘     │
+│            │                 │              │
+│        allowed           rejected           │
+│            │                 │              │
+│            ▼                 ▼              │
+│   ┌──────────────┐  ┌────────────────┐     │
+│   │   Reverse    │  │  429 Too Many  │     │
+│   │    Proxy     │  │  Retry-After   │     │
+│   └───────┬──────┘  └────────────────┘     │
+│           │                                 │
+└───────────┼─────────────────────────────────┘
+            │
+            ▼
+      Backend :9000
 ```
 
-## Design Decisions
-
-### 1. Sliding window via sorted sets
-
-The rate limiter uses a Redis sorted set per key, with timestamps as scores. Each request adds an entry, and the Lua script atomically trims entries outside the window, counts the remainder, and decides allow/reject in a single round trip. This gives true sliding-window behavior (no fixed-window edge spikes) at the cost of O(n) storage per window.
-
-### 2. Lua script atomicity
-
-The entire check-and-increment runs as one Lua script via `EVAL`. Redis executes Lua atomically, so there is no race between reading the count and adding a new entry. This is what makes the concurrent accuracy test pass (exactly 50 allowed out of 100 goroutines against a limit of 50).
-
-### 3. Per-client and per-route configuration
-
-The gateway resolves limits in two layers: per-route limits from config, and per-client overrides (e.g., premium API keys get higher limits). The rate-limit key combines client ID and path, so a client's `/api/search` limit is independent of their `/api/data` limit.
-
-### 4. Standard HTTP rate-limit headers
-
-Every response includes `X-RateLimit-Limit`, `X-RateLimit-Remaining`, and `X-RateLimit-Window`. Rejected responses include `Retry-After` in seconds, following RFC 6585.
-
-### 5. Reverse proxy via stdlib
-
-The gateway uses `net/http/httputil.ReverseProxy` from Go's standard library. No third-party HTTP frameworks. The proxy is configured per route at startup, so there is no allocation per request beyond the rate limit check.
-
-## API
+## Headers
 
 | Header | Direction | Description |
-|---|---|---|
+|--------|-----------|-------------|
 | `X-API-Key` | Request | Client identifier (falls back to X-Forwarded-For, then RemoteAddr) |
 | `X-RateLimit-Limit` | Response | Maximum requests allowed in the window |
 | `X-RateLimit-Remaining` | Response | Requests remaining in the current window |
@@ -102,7 +115,7 @@ docker compose up
 
 ## Lua Script
 
-The rate limiting logic is a single atomic Redis Lua script:
+The entire check-and-increment runs as one atomic Lua script via `EVAL`. Redis executes Lua atomically, so there is no race between reading the count and adding a new entry.
 
 ```lua
 local key = KEYS[1]
@@ -124,6 +137,31 @@ else
     return {1, 0, retry_after}  -- rejected, 0 remaining, retry_after_ms
 end
 ```
+
+<details>
+<summary><strong>Design Decisions</strong></summary>
+
+### 1. Sliding window via sorted sets
+
+The rate limiter uses a Redis sorted set per key, with timestamps as scores. Each request adds an entry, and the Lua script atomically trims entries outside the window, counts the remainder, and decides allow/reject in a single round trip. This gives true sliding-window behavior (no fixed-window edge spikes) at the cost of O(n) storage per window.
+
+### 2. Lua script atomicity
+
+The entire check-and-increment runs as one Lua script via `EVAL`. Redis executes Lua atomically, so there is no race between reading the count and adding a new entry. This is what makes the concurrent accuracy test pass (exactly 50 allowed out of 100 goroutines against a limit of 50).
+
+### 3. Per-client and per-route configuration
+
+The gateway resolves limits in two layers: per-route limits from config, and per-client overrides (e.g., premium API keys get higher limits). The rate-limit key combines client ID and path, so a client's `/api/search` limit is independent of their `/api/data` limit.
+
+### 4. Standard HTTP rate-limit headers
+
+Every response includes `X-RateLimit-Limit`, `X-RateLimit-Remaining`, and `X-RateLimit-Window`. Rejected responses include `Retry-After` in seconds, following RFC 6585.
+
+### 5. Reverse proxy via stdlib
+
+The gateway uses `net/http/httputil.ReverseProxy` from Go's standard library. No third-party HTTP frameworks. The proxy is configured per route at startup, so there is no allocation per request beyond the rate limit check.
+
+</details>
 
 ## Tests
 
